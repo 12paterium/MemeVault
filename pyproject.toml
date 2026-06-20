@@ -1,0 +1,19 @@
+[project]
+name = "meme-vault"
+version = "2.0.0"
+description = "语义向量检索表情包管理系统"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.24",
+    "numpy>=1.24",
+]
+
+[project.scripts]
+meme-vault = "meme_vault.cli:cli"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["meme_vault*"]

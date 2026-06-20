@@ -1,52 +1,7 @@
-import asyncio, base64, json, time
+import asyncio, base64, json
 import httpx
 
 from . import config
-
-
-def _estimate_tokens(text: str) -> int:
-    """Rough token estimate: ~1 token per char for CJK, ~4 chars per token for English."""
-    cjk = sum(1 for c in text if '一' <= c <= '鿿')
-    other = len(text) - cjk
-    return cjk + other // 4 + 1
-
-
-class RateLimiter:
-    def __init__(self, rpm: int, tpm: int):
-        self.max_rpm = rpm
-        self.max_tpm = tpm
-        self._req_log: list[float] = []
-        self._tokens_used: list[tuple[float, int]] = []
-        self._lock = asyncio.Lock()
-
-    def _slide(self):
-        now = time.monotonic()
-        cutoff = now - 60
-        self._req_log = [t for t in self._req_log if t > cutoff]
-        self._tokens_used = [(t, n) for t, n in self._tokens_used if t > cutoff]
-
-    async def acquire(self, estimated_tokens: int = 0):
-        async with self._lock:
-            self._slide()
-            while (
-                len(self._req_log) >= self.max_rpm
-                or (sum(n for _, n in self._tokens_used) + estimated_tokens > self.max_tpm)
-            ):
-                self._slide()
-                if not self._req_log and not self._tokens_used:
-                    break
-                # wait until the oldest request slides out of the 60s window
-                oldest_req = self._req_log[0] if self._req_log else 0
-                oldest_tok = self._tokens_used[0][0] if self._tokens_used else 0
-                wait = max(oldest_req, oldest_tok) + 60 - time.monotonic()
-                if wait > 0:
-                    await asyncio.sleep(wait)
-                self._slide()
-            self._req_log.append(time.monotonic())
-            self._tokens_used.append((time.monotonic(), estimated_tokens))
-
-
-_rl = RateLimiter(config.RATE_LIMIT_RPM, config.RATE_LIMIT_TPM)
 
 SCHEMA = {
     "type": "object",
@@ -88,8 +43,7 @@ class AIClient:
             await self._client.aclose()
             self._client = None
 
-    async def _post(self, url, body, token_estimate=0):
-        await _rl.acquire(token_estimate)
+    async def _post(self, url, body):
         client = await self._get_client()
         headers = {"Authorization": f"Bearer {self.api_key}"}
         for attempt in range(config.RETRY_COUNT):
@@ -101,7 +55,6 @@ class AIClient:
                 retry_after = int(data.get("error", {}).get("retry_after", 2 ** attempt))
                 await asyncio.sleep(retry_after)
                 continue
-            # non-429 or last retry — surface the error immediately
             raise RuntimeError(data.get("error", {}).get("message", str(data)))
         return resp.json()
 
@@ -118,8 +71,6 @@ class AIClient:
         if not self.model:
             return {"error": "Vision model not configured."}
 
-        # rough token estimate: image ~1k tokens, messages ~200 tokens
-        token_est = max(len(data) // 512, 200) + _estimate_tokens(VISION_PROMPT)
         try:
             data = await self._post(f"{self.base_url}/chat/completions", {
                 "model": self.model,
@@ -132,24 +83,21 @@ class AIClient:
                     ]},
                 ],
                 "response_format": {"type": "json_schema", "json_schema": {"name": "meme_analysis", "schema": SCHEMA}},
-            }, token_estimate=token_est)
+            })
             return json.loads(data["choices"][0]["message"]["content"])
         except Exception as e:
             return {"error": str(e)}
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
+    async def embed(self, inputs: list) -> list[list[float]]:
         if not self.api_key:
             raise RuntimeError("API key not set. Set SILICONFLOW_API_KEY.")
         if not self.model:
             raise RuntimeError("Embedding model not configured.")
-        if not texts:
+        if not inputs:
             return []
-
-        token_est = sum(_estimate_tokens(t) for t in texts)
         data = await self._post(f"{self.base_url}/embeddings", {
             "model": self.model,
-            "input": texts,
-        }, token_estimate=token_est)
-        # API may return embeddings in arbitrary order; sort by index to align with input order
+            "input": inputs,
+        })
         sorted_data = sorted(data["data"], key=lambda x: x["index"])
         return [item["embedding"] for item in sorted_data]

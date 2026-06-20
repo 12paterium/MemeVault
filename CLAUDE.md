@@ -18,43 +18,52 @@ Key design rules: data !== features !== index. Embeddings are rebuildable caches
 
 ```
 meme_vault/
-  AIClient.py    — httpx-based async client for SiliconFlow API (vision + embedding)
-  Metadata.py    — Metadata dataclass, JSON load/save, dedup by MD5 hash
-  Embedding.py   — build/search embeddings, prepare_texts() concatenates fields for embedding
-  config.py      — paths, model names, rate limits, batch size
-  Tests.py       — simple test that loads and prints metadata
-main.py          — CLI entry point (build, search, parse, batch, list, info)
+  vault.py       — MemeVault class: primary public API
+  client.py      — httpx async client for SiliconFlow API (vision + embedding)
+  metadata.py    — Metadata dataclass, JSON load/save, dedup by MD5 hash
+  embedding.py   — build_text/build_image embeddings, search, save, load
+  cli.py         — CLI entry point (thin wrapper around MemeVault)
+  config.py      — default models, constants (no paths)
+  Tests.py       — simple test
+main.py          — thin wrapper for `python main.py` compatibility
+pyproject.toml   — package metadata, deps, console_scripts entry point
 data/            — metadata.json + embeddings.npy (gitignored)
 images/          — meme image files
 ```
 
-## Commands
+## Python API
 
-```powershell
-# Analyze a single image and add to vault
-python main.py parse <image-path>
+```python
+from meme_vault import MemeVault
+import asyncio
 
-# Batch import all images from a directory
-python main.py batch [dir]
+async def main():
+    vault = MemeVault(
+        data_dir="./my_vault",
+        api_key="sk-xxx",                              # optional, defaults to env var
+        embedding_model="Qwen/Qwen3-VL-Embedding-8B",   # optional
+        vision_model="Qwen/Qwen3-VL-32B-Instruct",      # optional
+    )
 
-# Build embeddings from metadata (requires SILICONFLOW_API_KEY)
-python main.py build
+    await vault.parse("path/to/image.jpg")          # analyze + add
+    count = await vault.build_text()                # text → vectors
+    count = await vault.build_image()               # image → vectors
+    results = await vault.search("无语", top_k=5)   # [(Metadata, score), ...]
+    entries = vault.list()                          # list[Metadata]
+    info = vault.info()                             # dict
+    await vault.close()
 
-# Search memes by natural language query
-python main.py search <query text>
+asyncio.run(main())
+```
 
-# List all memes
-python main.py list
+## CLI
 
-# Show project info (key status, meme count, models used)
-python main.py info
-
-# Run simple metadata test
-python meme_vault/Tests.py
+```bash
+pip install -e .
+meme-vault build-text|build-image|search|parse|list|info
 ```
 
 ## Configuration
 
-- `SILICONFLOW_API_KEY` env var is required for all API-dependent commands (parse, build, search, batch)
-- Models are configured in `meme_vault/config.py`: embedding (`BAAI/bge-large-zh-v1.5`) and vision (`Qwen/Qwen3-VL-32B-Instruct`)
-- Rate limiting: 1000 RPM / 80000 TPM via sliding window in `AIClient.RateLimiter`
+- `SILICONFLOW_API_KEY` env var required for API calls
+- Default models in `config.py`: embedding `Qwen/Qwen3-VL-Embedding-8B`, vision `Qwen/Qwen3-VL-32B-Instruct`

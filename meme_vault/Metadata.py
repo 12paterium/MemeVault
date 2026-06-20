@@ -1,8 +1,6 @@
 import datetime, hashlib, json, os
-from .AIClient import AIClient
 from . import config
 
-image_client = AIClient(model=config.VISION_MODEL)
 
 
 class Metadata:
@@ -32,8 +30,11 @@ class Metadata:
         m.analyzed_by = data.get("analyzed_by", "") or ""
         return m
 
-    async def analyze(self) -> dict | None:
-        result = await image_client.parse_image(self.path)
+    async def analyze(self, client=None) -> dict | None:
+        from .client import AIClient
+        if client is None:
+            client = AIClient(model=config.VISION_MODEL)
+        result = await client.parse_image(self.path)
         if "error" in result:
             return result
         self.text = result.get("text", "") or ""
@@ -63,8 +64,7 @@ class Metadata:
             d["analyzed_by"] = self.analyzed_by
         return d
 
-
-def load_metadata(path: str = config.METADATA_PATH) -> list[Metadata]:
+def load_metadata(path: str) -> list[Metadata]:
     if not os.path.exists(path):
         return []
     try:
@@ -76,8 +76,7 @@ def load_metadata(path: str = config.METADATA_PATH) -> list[Metadata]:
         return []
     return [Metadata.from_dict(item) for item in data if isinstance(item, dict)]
 
-
-def save_metadata(entries: list[Metadata], path: str = config.METADATA_PATH):
+def save_metadata(entries: list[Metadata], path: str):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
