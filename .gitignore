@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.claude/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+
+# MemeVault data (rebuildable caches, not assets)
+data/*.json
+data/*.npy
+
+# Type checkers
+.mypy_cache/
+.pytest_cache/
