@@ -16,6 +16,8 @@ SCHEMA = {
     "required": ["text", "tags", "character", "emotion", "usage", "background"],
 }
 
+MEME_FORMAT = {"type": "json_schema", "json_schema": {"name": "meme_analysis", "schema": SCHEMA}}
+
 VISION_PROMPT = """分析这张表情包/梗图。必须输出 JSON 格式，包含：
 - text: 一句中文描述（画面内容 + 梗的含义，直白说清楚）
 - tags: 关键词标签（3-8个）
@@ -58,11 +60,23 @@ class AIClient:
             raise RuntimeError(data.get("error", {}).get("message", str(data)))
         return resp.json()
 
+    async def chat(self, messages, temperature=0.2, response_format=None,
+                  **kwargs) -> str:
+        if not self.api_key:
+            raise RuntimeError("API key not set. Set SILICONFLOW_API_KEY.")
+        if not self.model:
+            raise RuntimeError("Model not configured.")
+        body = {"model": self.model, "messages": messages,
+                "temperature": temperature, **kwargs}
+        if response_format is not None:
+            body["response_format"] = response_format
+        data = await self._post(f"{self.base_url}/chat/completions", body)
+        return data["choices"][0]["message"]["content"]
+
     async def parse_image(self, image_path: str) -> dict:
         try:
             with open(image_path, "rb") as f:
-                data = f.read()
-                b64 = base64.b64encode(data).decode()
+                b64 = base64.b64encode(f.read()).decode()
         except Exception as e:
             return {"error": str(e)}
 
@@ -72,19 +86,17 @@ class AIClient:
             return {"error": "Vision model not configured."}
 
         try:
-            data = await self._post(f"{self.base_url}/chat/completions", {
-                "model": self.model,
-                "temperature": 0.2,
-                "messages": [
+            text = await self.chat(
+                messages=[
                     {"role": "system", "content": VISION_PROMPT},
                     {"role": "user", "content": [
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                         {"type": "text", "text": "Analyze this meme."},
                     ]},
                 ],
-                "response_format": {"type": "json_schema", "json_schema": {"name": "meme_analysis", "schema": SCHEMA}},
-            })
-            return json.loads(data["choices"][0]["message"]["content"])
+                response_format=MEME_FORMAT,
+            )
+            return json.loads(text)
         except Exception as e:
             return {"error": str(e)}
 
