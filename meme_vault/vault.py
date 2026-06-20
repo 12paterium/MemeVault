@@ -50,6 +50,9 @@ class MemeVault:
         save_metadata(entries, self.metadata_path)
         return entry.text
 
+    async def build(self) -> int:
+        return await self.build_text()
+
     async def build_text(self) -> int:
         entries = load_metadata(self.metadata_path)
         if not entries:

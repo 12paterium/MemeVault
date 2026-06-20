@@ -2,7 +2,8 @@ import asyncio, sys, os
 from .vault import MemeVault
 
 HELP = """Commands:
-  build-text        Build embeddings from text metadata
+  build              Build embeddings from text metadata (default)
+  build-text         Same as build
   build-image       Build embeddings from images (cross-modal)
   search <text>     Search memes
   parse <path>      Analyze image and add to vault
@@ -16,7 +17,7 @@ async def main():
     cmd = sys.argv[1].lower()
     vault = MemeVault()
     try:
-        if cmd == "build-text":
+        if cmd in ("build", "build-text"):
             n = await vault.build_text()
             print(f"Done. {n} vectors ready.")
         elif cmd == "build-image":

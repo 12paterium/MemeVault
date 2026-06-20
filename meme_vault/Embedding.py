@@ -20,7 +20,7 @@ def prepare_texts(entries: list[Metadata]) -> list[str]:
         parts = []
         fname = os.path.splitext(os.path.basename(e.path))[0]
         if fname and fname != e.text:
-            parts.append(" ".join([fname] * 3))
+            parts.append(fname)
         if e.text:
             parts.append(e.text)
         if e.tags:
