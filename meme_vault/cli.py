@@ -7,8 +7,10 @@ HELP = """Commands:
   build-image       Build embeddings from images (cross-modal)
   search <text>     Search memes
   parse <path>      Analyze image and add to vault
+  parse -r <dir>    Recursively import all images from directory
   list              List all memes
-  info              Show project info"""
+  info              Show project info
+  status            Show working directory status"""
 
 
 async def main():
@@ -36,8 +38,12 @@ async def main():
                 if m.background: print(f"     bg: {m.background}")
                 print()
         elif cmd == "parse" and len(sys.argv) >= 3:
-            text = await vault.parse(sys.argv[2])
-            print(f"Added: {text}")
+            if sys.argv[2] in ("-r", "--recursive") and len(sys.argv) >= 4:
+                n = await vault.parse_dir(sys.argv[3])
+                print(f"Done. {n} images imported.")
+            else:
+                text = await vault.parse(sys.argv[2])
+                print(f"Added: {text}")
         elif cmd == "list":
             entries = vault.list()
             if not entries:
@@ -54,6 +60,38 @@ async def main():
                 print("Models:")
                 for m, n in sorted(info["models"].items(), key=lambda x: -x[1]):
                     print(f"  {m}: {n}")
+        elif cmd == "status":
+            s = vault.status()
+            print(f"Data directory:  {s['data_dir']}")
+            print(f"API key:         {'OK' if s['api_key'] else 'Missing'}")
+            print(f"Embedding model: {s['embedding_model']}")
+            print(f"Vision model:    {s['vision_model']}")
+            print()
+            m = s["metadata"]
+            print(f"Metadata: {m['total']} entries ({m['analyzed']} analyzed)")
+            print(f"  Paths:   {m['paths_exist']} exist, {m['paths_missing']} missing")
+            if m["models"]:
+                print(f"  Models:  {', '.join(f'{k}: {v}' for k, v in m['models'].items())}")
+            print()
+            e = s["embeddings"]
+            if e:
+                print(f"Embeddings: shape={e.get('shape')}, dtype={e.get('dtype')}")
+                if e.get("up_to_date"):
+                    print(f"  Status:   up to date")
+                elif "error" in e:
+                    print(f"  Status:   {e['error']}")
+                else:
+                    print(f"  Status:   needs rebuild ({m['total']} entries, {e['shape'][0]} vectors)")
+            else:
+                print("Embeddings: none")
+            print()
+            img = s["images"]
+            if img["directory"]:
+                print(f"Images directory: {img['directory']}")
+                print(f"  Files:    {img['files']}")
+                print(f"  Unparsed: {img['unparsed']}")
+            else:
+                print("Images directory: not found")
         else:
             print(HELP)
     except (ValueError, RuntimeError) as e:

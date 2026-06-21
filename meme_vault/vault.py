@@ -7,6 +7,20 @@ from .embedding import (
     save_embeddings, load_embeddings, search,
 )
 
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+
+
+def _count_images(root: str) -> int:
+    """Count image files under a directory."""
+    if not os.path.isdir(root):
+        return 0
+    total = 0
+    for dirpath, _, filenames in os.walk(root):
+        for f in filenames:
+            if os.path.splitext(f)[1].lower() in IMAGE_EXTS:
+                total += 1
+    return total
+
 
 class MemeVault:
     def __init__(self, data_dir="./data", api_key=None,
@@ -49,6 +63,32 @@ class MemeVault:
         entries.append(entry)
         save_metadata(entries, self.metadata_path)
         return entry.text
+
+    async def parse_dir(self, root_dir: str) -> int:
+        if not os.path.isdir(root_dir):
+            raise ValueError(f"Directory not found: {root_dir}")
+        entries = load_metadata(self.metadata_path)
+        existing = {e.id for e in entries if e.id}
+        added = 0
+        client = self._get_vision_client()
+        for dirpath, _, filenames in os.walk(root_dir):
+            for f in filenames:
+                if os.path.splitext(f)[1].lower() not in IMAGE_EXTS:
+                    continue
+                fp = os.path.join(dirpath, f)
+                entry = Metadata(fp)
+                if not entry.id or entry.id in existing:
+                    continue
+                error = await entry.analyze(client)
+                if error:
+                    print(f"  SKIP: {fp} — {error.get('error', '?')}")
+                    continue
+                entries.append(entry)
+                existing.add(entry.id)
+                added += 1
+                print(f"  [{added}] {entry.text}")
+        save_metadata(entries, self.metadata_path)
+        return added
 
     async def build(self) -> int:
         return await self.build_text()
@@ -124,6 +164,67 @@ class MemeVault:
             "embedding_model": self.embedding_model,
             "vision_model": self.vision_model,
             "models": models,
+        }
+
+    def status(self) -> dict:
+        entries = load_metadata(self.metadata_path)
+        analyzed = sum(1 for e in entries if e.analyzed_at)
+        paths_exist = sum(1 for e in entries if e.path and os.path.exists(e.path))
+        paths_missing = len(entries) - paths_exist
+        models = {}
+        for e in entries:
+            m = e.analyzed_by or "unknown"
+            models[m] = models.get(m, 0) + 1
+
+        emb_info = None
+        emb_path = self.embeddings_path
+        if os.path.exists(emb_path):
+            try:
+                emb = load_embeddings(emb_path)
+                emb_info = {"shape": list(emb.shape), "dtype": str(emb.dtype)}
+                emb_info["up_to_date"] = emb.shape[0] == len(entries)
+            except Exception:
+                emb_info = {"error": "corrupt or unreadable"}
+
+        image_root = os.path.join(os.path.dirname(self.data_dir), "images")
+        image_count = _count_images(image_root)
+
+        # find unparsed images
+        import hashlib
+        parsed_ids = {e.id for e in entries if e.id}
+        unparsed = 0
+        if os.path.isdir(image_root):
+            for dirpath, _, filenames in os.walk(image_root):
+                for f in filenames:
+                    if os.path.splitext(f)[1].lower() not in IMAGE_EXTS:
+                        continue
+                    fp = os.path.join(dirpath, f)
+                    try:
+                        with open(fp, "rb") as fh:
+                            h = hashlib.md5(fh.read()).hexdigest()
+                        if h not in parsed_ids:
+                            unparsed += 1
+                    except OSError:
+                        pass
+
+        return {
+            "data_dir": self.data_dir,
+            "api_key": bool(self.api_key),
+            "embedding_model": self.embedding_model,
+            "vision_model": self.vision_model,
+            "metadata": {
+                "total": len(entries),
+                "analyzed": analyzed,
+                "paths_exist": paths_exist,
+                "paths_missing": paths_missing,
+                "models": models,
+            },
+            "embeddings": emb_info,
+            "images": {
+                "directory": image_root if os.path.isdir(image_root) else None,
+                "files": image_count,
+                "unparsed": unparsed,
+            },
         }
 
     async def close(self):
