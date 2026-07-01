@@ -8,14 +8,20 @@ HELP = """Commands:
   search <text>     Search memes
   parse <path>      Analyze image and add to vault
   parse -r <dir>    Recursively import all images from directory
+  parse -r -f <dir> Force re-parse even if already imported
   list              List all memes
   info              Show project info
-  status            Show working directory status"""
+  status            Show working directory status
+  --version, -v     Show version number"""
 
 
 async def main():
     if len(sys.argv) < 2:
         print(HELP); return
+    if sys.argv[1] in ("--version", "-v"):
+        from .vault import __version__
+        print(f"meme-vault {__version__}")
+        return
     cmd = sys.argv[1].lower()
     vault = MemeVault()
     try:
@@ -39,8 +45,9 @@ async def main():
                 print()
         elif cmd == "parse" and len(sys.argv) >= 3:
             if sys.argv[2] in ("-r", "--recursive") and len(sys.argv) >= 4:
-                n = await vault.parse_dir(sys.argv[3])
-                print(f"Done. {n} images imported.")
+                force = "-f" in sys.argv or "--force" in sys.argv
+                n = await vault.parse_dir(sys.argv[3], force=force)
+                print(f"Done. {n} new images imported.")
             else:
                 text = await vault.parse(sys.argv[2])
                 print(f"Added: {text}")
@@ -62,10 +69,12 @@ async def main():
                     print(f"  {m}: {n}")
         elif cmd == "status":
             s = vault.status()
+            print(f"Version:         {s['version']}")
             print(f"Data directory:  {s['data_dir']}")
             print(f"API key:         {'OK' if s['api_key'] else 'Missing'}")
             print(f"Embedding model: {s['embedding_model']}")
             print(f"Vision model:    {s['vision_model']}")
+            print(f"Embedding mode:  {s['embedding_mode'] or 'none (run build first)'}")
             print()
             m = s["metadata"]
             print(f"Metadata: {m['total']} entries ({m['analyzed']} analyzed)")

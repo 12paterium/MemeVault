@@ -1,4 +1,4 @@
-import asyncio, base64, os, numpy as np
+import asyncio, base64, json, os, numpy as np
 from .client import AIClient
 from .metadata import Metadata
 from . import config
@@ -15,6 +15,7 @@ def _read_image_b64(path: str) -> str:
 
 
 def prepare_texts(entries: list[Metadata]) -> list[str]:
+    """Legacy: concatenate all fields into one string per entry."""
     texts = []
     for e in entries:
         parts = []
@@ -37,12 +38,48 @@ def prepare_texts(entries: list[Metadata]) -> list[str]:
     return texts
 
 
+def prepare_field_texts(entries: list[Metadata]) -> list[list[str]]:
+    """Return per-entry list of individual field texts for separate embedding."""
+    result = []
+    for e in entries:
+        fields = []
+        fname = os.path.splitext(os.path.basename(e.path))[0]
+        if fname and fname != e.text:
+            fields.append(fname)
+        if e.text:
+            fields.append(e.text)
+        if e.tags:
+            fields.append(" ".join(e.tags))
+        if e.emotion:
+            fields.append(" ".join(e.emotion))
+        if e.usage:
+            fields.append(" ".join(e.usage))
+        if e.character:
+            fields.append(" ".join(e.character))
+        if e.background and e.background != "无":
+            fields.append(e.background)
+        if not fields:
+            fields.append("(empty)")
+        result.append(fields)
+    return result
+
+
 async def build_text_embeddings(client: AIClient, entries: list[Metadata]) -> np.ndarray:
+    """Embed each semantic field separately, then average-pool per entry."""
     if not entries:
         return np.empty((0, 0), dtype=np.float32)
-    texts = prepare_texts(entries)
-    vectors = await _embed_with_retry(client, texts)
-    return np.array(vectors, dtype=np.float32)
+    field_texts = prepare_field_texts(entries)
+    flat = [t for fields in field_texts for t in fields]
+    vectors = await _embed_with_retry(client, flat)
+    arr = np.array(vectors, dtype=np.float32)
+    dim = arr.shape[1]
+    result = []
+    i = 0
+    for fields in field_texts:
+        n = len(fields)
+        result.append(arr[i:i+n].mean(axis=0) if n > 0 else np.zeros(dim, dtype=np.float32))
+        i += n
+    return np.array(result, dtype=np.float32)
 
 
 async def build_image_embeddings(client: AIClient, entries: list[Metadata]) -> np.ndarray:
@@ -69,6 +106,28 @@ def save_embeddings(embeddings: np.ndarray, path: str):
         return
     os.makedirs(os.path.dirname(path), exist_ok=True)
     np.save(path, embeddings)
+
+
+def save_embedding_meta(embeddings_path: str, *, mode: str):
+    meta_path = _meta_path(embeddings_path)
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump({"mode": mode}, f)
+
+
+def load_embedding_meta(embeddings_path: str) -> dict | None:
+    meta_path = _meta_path(embeddings_path)
+    if not os.path.exists(meta_path):
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _meta_path(embeddings_path: str) -> str:
+    base, _ = os.path.splitext(embeddings_path)
+    return base + "_meta.json"
 
 
 def load_embeddings(path: str) -> np.ndarray:
@@ -107,4 +166,4 @@ async def search(client: AIClient, query: str, entries: list[Metadata],
     similarities = np.clip(embeddings[valid] @ query_vec / (norms[valid] * query_norm), -1, 1)
     indices = np.argsort(similarities)[-top_k:][::-1]
     original_indices = np.where(valid)[0][indices]
-    return [(entries[i], float(similarities[j])) for j, i in enumerate(original_indices)]
+    return [(entries[i], float(similarities[indices[j]])) for j, i in enumerate(original_indices)]

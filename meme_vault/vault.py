@@ -1,10 +1,17 @@
 import asyncio, os, numpy as np
+
+try:
+    __version__ = __import__("importlib.metadata").metadata.version("meme-vault")
+except Exception:
+    __version__ = "0.0.0"
+
 from . import config as defaults
 from .client import AIClient
 from .metadata import Metadata, load_metadata, save_metadata
 from .embedding import (
     build_text_embeddings, build_image_embeddings,
     save_embeddings, load_embeddings, search,
+    save_embedding_meta, load_embedding_meta,
 )
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
@@ -64,11 +71,12 @@ class MemeVault:
         save_metadata(entries, self.metadata_path)
         return entry.text
 
-    async def parse_dir(self, root_dir: str) -> int:
+    async def parse_dir(self, root_dir: str, force: bool = False) -> int:
         if not os.path.isdir(root_dir):
             raise ValueError(f"Directory not found: {root_dir}")
         entries = load_metadata(self.metadata_path)
-        existing = {e.id for e in entries if e.id}
+        id_index = {e.id: i for i, e in enumerate(entries) if e.id}
+        old_models = {e.id: e.analyzed_by for e in entries if e.id}
         added = 0
         client = self._get_vision_client()
         for dirpath, _, filenames in os.walk(root_dir):
@@ -77,16 +85,24 @@ class MemeVault:
                     continue
                 fp = os.path.join(dirpath, f)
                 entry = Metadata(fp)
-                if not entry.id or entry.id in existing:
+                if not entry.id:
+                    continue
+                # skip if same ID, same model, and not forced
+                old_model = old_models.get(entry.id)
+                if not force and entry.id in id_index and old_model == self.vision_model:
                     continue
                 error = await entry.analyze(client)
                 if error:
                     print(f"  SKIP: {fp} — {error.get('error', '?')}")
                     continue
-                entries.append(entry)
-                existing.add(entry.id)
-                added += 1
-                print(f"  [{added}] {entry.text}")
+                if entry.id in id_index:
+                    entries[id_index[entry.id]] = entry
+                    print(f"  [UPDATE] {entry.text}")
+                else:
+                    entries.append(entry)
+                    id_index[entry.id] = len(entries) - 1
+                    added += 1
+                    print(f"  [{added}] {entry.text}")
         save_metadata(entries, self.metadata_path)
         return added
 
@@ -99,7 +115,8 @@ class MemeVault:
             raise ValueError("No entries. Add some with parse() first.")
         client = self._get_embed_client()
         old = self._load_existing_embeddings()
-        if old is not None and old.shape[0] == len(entries):
+        meta = load_embedding_meta(self.embeddings_path)
+        if old is not None and old.shape[0] == len(entries) and meta is not None:
             return old.shape[0]  # nothing new
         if old is not None and old.shape[0] < len(entries):
             new_entries = entries[old.shape[0]:]
@@ -108,6 +125,7 @@ class MemeVault:
         else:
             embeddings = await build_text_embeddings(client, entries)
         save_embeddings(embeddings, self.embeddings_path)
+        save_embedding_meta(self.embeddings_path, mode="text")
         return embeddings.shape[0]
 
     async def build_image(self) -> int:
@@ -116,7 +134,8 @@ class MemeVault:
             raise ValueError("No entries. Add some with parse() first.")
         client = self._get_embed_client()
         old = self._load_existing_embeddings()
-        if old is not None and old.shape[0] == len(entries):
+        meta = load_embedding_meta(self.embeddings_path)
+        if old is not None and old.shape[0] == len(entries) and meta is not None:
             return old.shape[0]
         if old is not None and old.shape[0] < len(entries):
             new_entries = entries[old.shape[0]:]
@@ -125,6 +144,7 @@ class MemeVault:
         else:
             embeddings = await build_image_embeddings(client, entries)
         save_embeddings(embeddings, self.embeddings_path)
+        save_embedding_meta(self.embeddings_path, mode="image")
         return embeddings.shape[0]
 
     def _load_existing_embeddings(self):
@@ -141,10 +161,22 @@ class MemeVault:
             embeddings = load_embeddings(self.embeddings_path)
         except (FileNotFoundError, RuntimeError):
             raise RuntimeError("No embeddings. Run build_text() or build_image() first.")
+
+        meta = load_embedding_meta(self.embeddings_path)
+        mode = (meta or {}).get("mode", "text")
+
         if len(entries) != embeddings.shape[0]:
-            raise RuntimeError(
-                f"Entry/embedding mismatch: {len(entries)} entries vs "
-                f"{embeddings.shape[0]} embeddings. Rebuild.")
+            print(f"Embeddings stale ({embeddings.shape[0]} → {len(entries)} entries), "
+                  f"auto-rebuilding ({mode})...")
+            client = self._get_embed_client()
+            if mode == "image":
+                embeddings = await build_image_embeddings(client, entries)
+            else:
+                embeddings = await build_text_embeddings(client, entries)
+            save_embeddings(embeddings, self.embeddings_path)
+            save_embedding_meta(self.embeddings_path, mode=mode)
+            print(f"  Rebuilt {embeddings.shape[0]} vectors.")
+
         client = self._get_embed_client()
         return await search(client, query, entries, embeddings, top_k)
 
@@ -207,11 +239,16 @@ class MemeVault:
                     except OSError:
                         pass
 
+        meta = load_embedding_meta(self.embeddings_path)
+        embedding_mode = (meta or {}).get("mode", None)
+
         return {
+            "version": __version__,
             "data_dir": self.data_dir,
             "api_key": bool(self.api_key),
             "embedding_model": self.embedding_model,
             "vision_model": self.vision_model,
+            "embedding_mode": embedding_mode,
             "metadata": {
                 "total": len(entries),
                 "analyzed": analyzed,
