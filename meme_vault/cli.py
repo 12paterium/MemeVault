@@ -1,119 +1,173 @@
-import asyncio, sys, os
-from .vault import MemeVault
+import argparse
+import asyncio
 
-HELP = """Commands:
-  build              Build embeddings from text metadata (default)
-  build-text         Same as build
-  build-image       Build embeddings from images (cross-modal)
-  search <text>     Search memes
-  parse <path>      Analyze image and add to vault
-  parse -r <dir>    Recursively import all images from directory
-  parse -r -f <dir> Force re-parse even if already imported
-  list              List all memes
-  info              Show project info
-  status            Show working directory status
-  --version, -v     Show version number"""
+from .embedding import SearchQuery
+from .vault import MemeVault, __version__
 
 
-async def main():
-    if len(sys.argv) < 2:
-        print(HELP); return
-    if sys.argv[1] in ("--version", "-v"):
-        from .vault import __version__
-        print(f"meme-vault {__version__}")
+DEFAULT_DATA_DIR = "./data"
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="meme-vault",
+        description="Semantic meme search with character, usage, and content ranking.",
+    )
+    parser.add_argument("--version", "-v", action="version", version=f"meme-vault {__version__}")
+    parser.add_argument(
+        "--data-dir",
+        default=DEFAULT_DATA_DIR,
+        help=f"Vault data directory (default: {DEFAULT_DATA_DIR})",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    build = subparsers.add_parser("build", help="Build the three-dimension search index")
+    build.add_argument("--force", action="store_true", help="Rebuild even when the index is current")
+
+    search = subparsers.add_parser("search", help="Search memes")
+    search.add_argument("query", nargs="*", help="Natural-language query")
+    search.add_argument("--character", default="", help="Character or visual identity")
+    search.add_argument("--usage", default="", help="Intended usage or chat situation")
+    search.add_argument("--content", default="", help="Description, emotion, tags, or background")
+    search.add_argument("--top-n", type=int, default=5, help="Number of results")
+    search.add_argument("--rerank", action="store_true", help="Rerank candidates with the rerank model")
+    search.add_argument("--character-weight", type=float)
+    search.add_argument("--usage-weight", type=float)
+    search.add_argument("--content-weight", type=float)
+
+    parse = subparsers.add_parser("parse", help="Analyze images and update metadata")
+    parse.add_argument("path")
+    parse.add_argument("-r", "--recursive", action="store_true")
+    parse.add_argument("-f", "--force", action="store_true")
+
+    subparsers.add_parser("prune", help="Remove entries whose image files are missing")
+
+    subparsers.add_parser("status", help="Show metadata, index, and image status")
+    return parser
+
+
+def _collect_weights(args) -> dict[str, float]:
+    weights = {}
+    for dimension in ("character", "usage", "content"):
+        value = getattr(args, f"{dimension}_weight")
+        if value is not None:
+            weights[dimension] = value
+    return weights
+
+
+def _structured_query(args) -> SearchQuery | None:
+    structured = bool(args.character or args.usage or args.content)
+    if not structured:
+        if _collect_weights(args):
+            raise ValueError("Weight options require a structured query field.")
+        return None
+    if args.query:
+        raise ValueError("Use either a natural-language query or structured query options, not both.")
+    return SearchQuery(
+        character=args.character,
+        usage=args.usage,
+        content=args.content,
+    )
+
+
+def _print_results(results):
+    if not results:
+        print("No results.")
         return
-    cmd = sys.argv[1].lower()
-    vault = MemeVault()
+    for number, result in enumerate(results, 1):
+        score = f"{result.score:.4f}"
+        if result.rerank_score is not None:
+            score += f" rerank={result.rerank_score:.4f}"
+        print(f"  {number}. [{score}] {result.metadata.text}")
+        for dimension in ("character", "usage", "content"):
+            detail = result.dimensions.get(dimension)
+            if detail is None:
+                continue
+            print(
+                f"     {dimension}: similarity={detail.similarity:.4f}, "
+                f"rank={detail.rank}, weight={detail.weight:g}, "
+                f"contribution={detail.contribution:.4f}"
+            )
+        print(f"     path: {result.metadata.path}")
+        print()
+
+
+async def main(argv=None):
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if not args.command:
+        parser.print_help()
+        return 0
+
+    vault = MemeVault(data_dir=args.data_dir)
     try:
-        if cmd in ("build", "build-text"):
-            n = await vault.build_text()
-            print(f"Done. {n} vectors ready.")
-        elif cmd == "build-image":
-            n = await vault.build_image()
-            print(f"Done. {n} vectors ready.")
-        elif cmd == "search" and len(sys.argv) >= 3:
-            query = " ".join(sys.argv[2:])
-            results = await vault.search(query)
-            if not results:
-                print("No results."); return
-            print(f"\nTop {len(results)} for: {query}\n")
-            for i, (m, score) in enumerate(results, 1):
-                print(f"  {i}. [{score:.3f}] {m.text}")
-                if m.tags: print(f"     tags: {', '.join(m.tags)}")
-                if m.emotion: print(f"     mood: {', '.join(m.emotion)}")
-                if m.background: print(f"     bg: {m.background}")
-                print()
-        elif cmd == "parse" and len(sys.argv) >= 3:
-            if sys.argv[2] in ("-r", "--recursive") and len(sys.argv) >= 4:
-                force = "-f" in sys.argv or "--force" in sys.argv
-                n = await vault.parse_dir(sys.argv[3], force=force)
-                print(f"Done. {n} new images imported.")
+        if args.command == "build":
+            count = await vault.build(force=args.force)
+            print(f"Done. {count} entries indexed across 3 dimensions.")
+        elif args.command == "search":
+            query = _structured_query(args)
+            if query is None:
+                query = " ".join(args.query).strip()
+            results = await vault.search(
+                query,
+                top_n=args.top_n,
+                weights=_collect_weights(args) or None,
+                rerank=args.rerank,
+            )
+            _print_results(results)
+        elif args.command == "parse":
+            if args.recursive:
+                count = await vault.parse_dir(args.path, force=args.force)
+                print(f"Done. {count} new images imported.")
             else:
-                text = await vault.parse(sys.argv[2])
-                print(f"Added: {text}")
-        elif cmd == "list":
-            entries = vault.list()
-            if not entries:
-                print("No memes in vault.")
-            else:
-                for i, e in enumerate(entries, 1):
-                    print(f"  {i}. {e.text}  ({e.path})")
-        elif cmd == "info":
-            info = vault.info()
-            print(f"Data: {info['data_dir']}")
-            print(f"Key:  {'OK' if info['has_key'] else 'Missing'}")
-            print(f"Memes: {info['memes']}")
-            if info["models"]:
-                print("Models:")
-                for m, n in sorted(info["models"].items(), key=lambda x: -x[1]):
-                    print(f"  {m}: {n}")
-        elif cmd == "status":
-            s = vault.status()
-            print(f"Version:         {s['version']}")
-            print(f"Data directory:  {s['data_dir']}")
-            print(f"API key:         {'OK' if s['api_key'] else 'Missing'}")
-            print(f"Embedding model: {s['embedding_model']}")
-            print(f"Vision model:    {s['vision_model']}")
-            print(f"Embedding mode:  {s['embedding_mode'] or 'none (run build first)'}")
+                if args.force:
+                    raise ValueError("--force is only valid with --recursive.")
+                entry = await vault.parse(args.path)
+                print(f"Added: {entry.text}")
+        elif args.command == "prune":
+            removed = vault.prune()
+            print(f"Done. {len(removed)} entries removed.")
+            for entry in removed:
+                print(f"  - {entry.text}  ({entry.path})")
+        elif args.command == "status":
+            status = vault.status()
+            metadata = status["metadata"]
+            index = status["index"]
+            images = status["images"]
+            print(f"Version:         {status['version']}")
+            print(f"Data directory:  {status['data_dir']}")
+            print(f"API key:         {'OK' if status['api_key'] else 'Missing'}")
+            print(f"Embedding model: {status['embedding_model']}")
+            print(f"Vision model:    {status['vision_model']}")
+            print(f"Rerank model:    {status['rerank_model']}")
             print()
-            m = s["metadata"]
-            print(f"Metadata: {m['total']} entries ({m['analyzed']} analyzed)")
-            print(f"  Paths:   {m['paths_exist']} exist, {m['paths_missing']} missing")
-            if m["models"]:
-                print(f"  Models:  {', '.join(f'{k}: {v}' for k, v in m['models'].items())}")
-            print()
-            e = s["embeddings"]
-            if e:
-                print(f"Embeddings: shape={e.get('shape')}, dtype={e.get('dtype')}")
-                if e.get("up_to_date"):
-                    print(f"  Status:   up to date")
-                elif "error" in e:
-                    print(f"  Status:   {e['error']}")
-                else:
-                    print(f"  Status:   needs rebuild ({m['total']} entries, {e['shape'][0]} vectors)")
+            print(f"Metadata: {metadata['total']} entries ({metadata['analyzed']} analyzed)")
+            print(f"  Paths:   {metadata['paths_exist']} exist, {metadata['paths_missing']} missing")
+            if index:
+                state = "up to date" if index["up_to_date"] else "needs rebuild"
+                print(
+                    f"Index: {index['count']} entries x {index['dimension_size']} dimensions "
+                    f"({state})"
+                )
+                print(f"  Channels: {', '.join(index['dimensions'])}")
             else:
-                print("Embeddings: none")
-            print()
-            img = s["images"]
-            if img["directory"]:
-                print(f"Images directory: {img['directory']}")
-                print(f"  Files:    {img['files']}")
-                print(f"  Unparsed: {img['unparsed']}")
+                print("Index: none (run build)")
+            if images["directory"]:
+                print(f"Images: {images['files']} files, {images['unparsed']} unparsed")
+                print(f"  Directory: {images['directory']}")
             else:
-                print("Images directory: not found")
-        else:
-            print(HELP)
-    except (ValueError, RuntimeError) as e:
-        print(f"Error: {e}")
-    except KeyboardInterrupt:
-        pass
+                print("Images: directory not found")
+        return 0
+    except (TypeError, ValueError, RuntimeError) as error:
+        print(f"Error: {error}")
+        return 1
     finally:
         await vault.close()
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
-
-
 def cli():
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))
+
+
+if __name__ == "__main__":
+    cli()

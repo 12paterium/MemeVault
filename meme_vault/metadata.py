@@ -7,7 +7,10 @@ class Metadata:
     def __init__(self, path=""):
         self.path = path
         self.id = self.text = self.background = ""
-        self.tags = self.character = self.emotion = self.usage = []
+        self.tags = []
+        self.character = []
+        self.emotion = []
+        self.usage = []
         self.analyzed_at = ""
         self.analyzed_by = ""
         if path:
@@ -44,7 +47,7 @@ class Metadata:
         self.usage = result.get("usage", [])
         self.background = result.get("background", "") or ""
         self.analyzed_at = datetime.datetime.now().isoformat(timespec="seconds")
-        self.analyzed_by = config.VISION_MODEL
+        self.analyzed_by = client.model or config.VISION_MODEL
 
     def to_dict(self) -> dict:
         d = {

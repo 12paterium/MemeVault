@@ -1,33 +1,43 @@
-# Python
+# Python bytecode and packaging artifacts
 __pycache__/
 *.py[cod]
+*.egg
 *.egg-info/
-dist/
+.eggs/
 build/
+dist/
 
 # Virtual environments
 venv/
 .venv/
 env/
 
-# IDE
-.claude/
+# Test and type-check caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Environment and secrets
+.env
+.env.*
+
+# Editors and IDEs
 .idea/
 .vscode/
+.claude/
+.agents/
 *.swp
 *.swo
 
-# OS
+# OS artifacts
 .DS_Store
 Thumbs.db
+Desktop.ini
 
-# Environment
-.env
-
-# MemeVault data (rebuildable caches, not assets)
-data/*.json
-data/*.npy
-
-# Type checkers
-.mypy_cache/
-.pytest_cache/
+# Local vault data (rebuildable via parse/build) and private image set
+data/*
+!data/.gitkeep
+ResourceImages/

@@ -1,104 +1,61 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## Project Overview
 
-MemeVault — a semantic vector search system for meme images. Users type a natural language query and get the most relevant memes via cosine similarity on text embeddings.
+MemeVault is a local semantic search system for meme images. Image analysis produces structured metadata; search uses three independently embedded channels and weighted reciprocal-rank fusion.
 
-## Architecture (3-layer decoupled)
+## Architecture
 
-- **Data Layer** — `data/metadata.json`: annotated meme metadata (path, text, tags, character, emotion, usage, background). The "source of truth."
-- **Feature Layer** — `data/embeddings.npy`: cached text embeddings + `data/embeddings_meta.json` (mode marker). Never committed; can be rebuilt at any time.
-- **Retrieval Layer** — numpy cosine similarity search over embeddings.
-
-Key design rules: data !== features !== index. Embeddings are rebuildable caches, not assets. IDs are MD5 hashes of file content (not tied to filenames).
-
-## Embedding Strategy
-
-- **Text mode** (`build` / `build-text`): each semantic field (text, tags, emotion, usage, character, background, filename) is embedded separately, then average-pooled into one vector per entry. This prevents long text descriptions from drowning out short but important fields like tags or emotion.
-- **Image mode** (`build-image`): embeds the image directly via the cross-modal model.
-- A companion `embeddings_meta.json` file records which mode was used. Search auto-detects the mode and rebuilds stale embeddings on the fly if entry count changed.
+- Source data: `data/metadata.json` with text, tags, character, emotion, usage, and background.
+- Rebuildable index: `data/search_index.npz` plus `data/search_index_meta.json`.
+- Search channels: `character` (weight 3), `usage` (weight 3), and `content` (weight 1).
+- `content` combines description, tags, emotion, background, and filename. Character and usage are not duplicated into it.
+- Natural-language queries are decomposed with the configured vision/chat model. `SearchQuery` bypasses decomposition.
+- Each active channel performs cosine ranking; weighted RRF produces the final Top N.
 
 ## Code Structure
 
-```
+```text
 meme_vault/
-  vault.py       — MemeVault class: primary public API
-  client.py      — httpx async client for SiliconFlow API (vision + embedding)
-  metadata.py    — Metadata dataclass, JSON load/save, dedup by MD5 hash
-  embedding.py   — field-wise build_text / build_image, search, save/load
-  cli.py         — CLI entry point (thin wrapper around MemeVault)
-  config.py      — default models, constants (no paths)
-  Tests.py       — simple test
-main.py          — thin wrapper for `python main.py` compatibility
-pyproject.toml   — package metadata, deps, console_scripts entry point
-data/            — metadata.json + embeddings.npy + embeddings_meta.json (gitignored)
-images/          — meme image files
+  vault.py       - MemeVault orchestration and index freshness
+  embedding.py   - query/result types, index build, cosine ranking, RRF
+  client.py      - SiliconFlow chat, vision, and embedding client
+  metadata.py    - metadata model and JSON persistence
+  cli.py         - command-line interface
+  config.py      - models, weights, and retrieval constants
+tests/           - deterministic unit and integration tests
+ResourceImages/  - optional local image test set
 ```
 
-## Python API
+## Public API
 
 ```python
-from meme_vault import MemeVault
-import asyncio
+from meme_vault import MemeVault, SearchQuery
 
-async def main():
-    vault = MemeVault(
-        data_dir="./my_vault",
-        api_key="sk-xxx",                              # optional, defaults to env var
-        embedding_model="Qwen/Qwen3-VL-Embedding-8B",   # optional
-        vision_model="Qwen/Qwen3-VL-32B-Instruct",      # optional
+async with MemeVault() as vault:
+    count = await vault.build()
+    results = await vault.search("natural language", top_n=5)
+    results = await vault.search(
+        SearchQuery(character="初音未来", usage="吐槽", content="无语"),
+        top_n=5,
+        weights={"character": 3, "usage": 3, "content": 1},
     )
-
-    await vault.parse("path/to/image.jpg")          # analyze + add single image
-    await vault.parse_dir("./images")               # batch import all images in dir
-    count = await vault.build_text()                # text → vectors (field-wise)
-    count = await vault.build_image()               # image → vectors (cross-modal)
-    results = await vault.search("无语", top_k=5)   # [(Metadata, score), ...]
-    entries = vault.list()                          # list[Metadata]
-    info = vault.info()                             # dict
-    st = vault.status()                             # dict (see status() below)
-    await vault.close()
-
-asyncio.run(main())
 ```
 
-### `status()` return dict
+`SearchQuery` carries only channel content (character, usage, content); ranking weights are `search()` parameters. `search()` returns `list[SearchResult]`. Each result exposes `metadata`, normalized RRF `score`, and per-channel `dimensions` details. `MemeVault` is an async context manager and also exposes `parse` (returns `Metadata`), `parse_dir`, `prune`, and `status`.
 
-```python
-{
-    "version": "2.0.0",
-    "data_dir": "/path/to/data",
-    "api_key": True,
-    "embedding_model": "Qwen/Qwen3-VL-Embedding-8B",
-    "vision_model": "Qwen/Qwen3-VL-32B-Instruct",
-    "embedding_mode": "text" | "image" | None,
-    "metadata": {"total": 98, "analyzed": 98, "paths_exist": 98, "paths_missing": 0, "models": {...}},
-    "embeddings": {"shape": [98, 4096], "dtype": "float32", "up_to_date": True} | None,
-    "images": {"directory": "/path/to/images", "files": 120, "unparsed": 22},
-}
-```
-
-## CLI
+## Commands
 
 ```bash
-pip install -e .
-meme-vault --version          # show version
-meme-vault status             # show working directory status
-meme-vault build              # build text embeddings (field-wise)
-meme-vault build-image        # build image embeddings
-meme-vault search <text>      # search memes (auto-rebuilds if stale)
-meme-vault parse <path>       # analyze a single image
-meme-vault parse -r <dir>     # recursively import all images from dir
-meme-vault parse -r -f <dir>  # force re-parse even if already imported (e.g. after model change)
-meme-vault list               # list all memes
-meme-vault info               # show project info
+meme-vault build [--force]
+meme-vault search <text> [--top-n 5] [--rerank]
+meme-vault search --character <text> --usage <text> --content <text>
+meme-vault parse <path>
+meme-vault parse -r [-f] <directory>
+meme-vault prune
+meme-vault status
 ```
 
-Search auto-detects the previously used embedding mode (text or image) and auto-rebuilds if the metadata has changed since the last build.
+`--data-dir` (before the subcommand) selects the vault directory; default `./data`.
 
-## Configuration
-
-- `SILICONFLOW_API_KEY` env var required for API calls
-- Default models in `config.py`: embedding `Qwen/Qwen3-VL-Embedding-8B`, vision `Qwen/Qwen3-VL-32B-Instruct`
+Run tests with `python -m unittest discover -s tests -v`. Tests must not require API credentials or network access.

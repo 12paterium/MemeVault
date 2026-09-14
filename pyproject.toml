@@ -1,12 +1,33 @@
 [project]
 name = "meme-vault"
-version = "2.0.0"
+version = "3.1.0"
 description = "语义向量检索表情包管理系统"
+readme = "README.md"
 requires-python = ">=3.10"
+keywords = ["memes", "semantic-search", "embeddings", "rrf"]
+authors = [
+    { name = "12paterium" },
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Natural Language :: Chinese (Simplified)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Utilities",
+]
 dependencies = [
     "httpx>=0.24",
     "numpy>=1.24",
 ]
+
+[project.urls]
+Homepage = "https://github.com/12paterium/MemeVault"
 
 [project.scripts]
 meme-vault = "meme_vault.cli:cli"

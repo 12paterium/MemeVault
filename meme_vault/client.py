@@ -14,6 +14,7 @@ SCHEMA = {
         "background": {"type": "string"},
     },
     "required": ["text", "tags", "character", "emotion", "usage", "background"],
+    "additionalProperties": False,
 }
 
 MEME_FORMAT = {"type": "json_schema", "json_schema": {"name": "meme_analysis", "schema": SCHEMA}}
@@ -52,8 +53,11 @@ class AIClient:
             resp = await client.post(url, json=body, headers=headers)
             if resp.status_code == 200:
                 return resp.json()
-            data = resp.json()
-            if resp.status_code == 429 and attempt < config.RETRY_COUNT - 1:
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {"error": {"message": resp.text[:200]}}
+            if resp.status_code in config.RETRY_STATUSES and attempt < config.RETRY_COUNT - 1:
                 retry_after = int(data.get("error", {}).get("retry_after", 2 ** attempt))
                 await asyncio.sleep(retry_after)
                 continue
@@ -113,3 +117,17 @@ class AIClient:
         })
         sorted_data = sorted(data["data"], key=lambda x: x["index"])
         return [item["embedding"] for item in sorted_data]
+
+    async def rerank(self, query: str, documents: list, top_n: int = None) -> list[tuple[int, float]]:
+        """Score documents against a query. Returns (original index, score) sorted best-first."""
+        if not self.api_key:
+            raise RuntimeError("API key not set. Set SILICONFLOW_API_KEY.")
+        if not self.model:
+            raise RuntimeError("Rerank model not configured.")
+        if not documents:
+            return []
+        body = {"model": self.model, "query": query, "documents": documents}
+        if top_n is not None:
+            body["top_n"] = top_n
+        data = await self._post(f"{self.base_url}/rerank", body)
+        return [(item["index"], item["relevance_score"]) for item in data["results"]]
