@@ -1,6 +1,6 @@
 [project]
 name = "meme-vault"
-version = "3.2.0"
+version = "3.3.0"
 description = "语义向量检索表情包管理系统"
 readme = "README.md"
 requires-python = ">=3.10"

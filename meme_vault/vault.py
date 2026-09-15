@@ -24,7 +24,7 @@ from .embedding import (
 from .metadata import Metadata, directory_stamp, load_metadata, save_metadata
 
 
-__version__ = "3.2.0"
+__version__ = "3.3.0"
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
@@ -325,6 +325,19 @@ class MemeVault:
         if rerank and results:
             results = await self._apply_rerank(query, results)
         return results[:min(top_n, len(results))]
+
+    def entry_by_id(self, handle: str) -> Metadata | None:
+        """Look up an entry by full id or unambiguous id prefix, as handed out by search results."""
+        handle = (handle or "").strip().lower()
+        if not handle:
+            return None
+        entries = self._entries()
+        for entry in entries:
+            if entry.id == handle:
+                return entry
+        matches = [entry for entry in entries if entry.id.startswith(handle)]
+        # An ambiguous prefix must not silently pick a neighbour; callers get None instead.
+        return matches[0] if len(matches) == 1 else None
 
     async def _apply_rerank(
         self,
