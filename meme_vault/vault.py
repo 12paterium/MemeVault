@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 from dataclasses import replace
@@ -20,10 +21,10 @@ from .embedding import (
     save_search_index,
     search as rank_search,
 )
-from .metadata import Metadata, load_metadata, save_metadata
+from .metadata import Metadata, directory_stamp, load_metadata, save_metadata
 
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
@@ -46,6 +47,11 @@ def _file_md5(path: str) -> str:
     return digest.hexdigest()
 
 
+def _client_model(client) -> str:
+    """Model name reported by an injected client, used when no name is configured."""
+    return str(getattr(client, "model", "") or "")
+
+
 class MemeVault:
     def __init__(
         self,
@@ -56,25 +62,49 @@ class MemeVault:
         embedding_base_url=None,
         vision_api_key=None,
         vision_base_url=None,
+        chat_model=None,
+        chat_api_key=None,
+        chat_base_url=None,
         rerank_model=None,
         rerank_api_key=None,
         rerank_api_base=None,
+        embed_client=None,
+        vision_client=None,
+        chat_client=None,
+        rerank_client=None,
     ):
+        """Clients can be injected per role (any object with the AIClient interface:
+        `.model`, `chat`, `parse_image`, `embed`, `rerank`, `close`); injected clients
+        stay with their owner and are not closed by `close()`.
+        """
         self.data_dir = os.path.abspath(data_dir)
-        self.metadata_path = os.path.join(self.data_dir, "metadata.json")
         self.index_path = os.path.join(self.data_dir, "search_index.npz")
         self.api_key = api_key or defaults.API_KEY
-        self.embedding_model = embedding_model or defaults.EMBEDDING_MODEL
-        self.vision_model = vision_model or defaults.VISION_MODEL
+        self.embedding_model = embedding_model or _client_model(embed_client) or defaults.EMBEDDING_MODEL
+        self.vision_model = vision_model or _client_model(vision_client) or defaults.VISION_MODEL
         self.embedding_base_url = embedding_base_url or defaults.API_BASE
         self.vision_api_key = vision_api_key or self.api_key
         self.vision_base_url = vision_base_url or defaults.API_BASE
-        self.rerank_model = rerank_model or defaults.RERANK_MODEL
+        # query decomposition follows the vision provider unless configured separately
+        self.chat_model = chat_model or _client_model(chat_client) or self.vision_model
+        self.chat_api_key = chat_api_key or self.vision_api_key
+        self.chat_base_url = chat_base_url or self.vision_base_url
+        self.rerank_model = rerank_model or _client_model(rerank_client) or defaults.RERANK_MODEL
         self.rerank_api_key = rerank_api_key or self.api_key
         self.rerank_api_base = rerank_api_base or defaults.API_BASE
-        self._embed_client = None
-        self._vision_client = None
-        self._rerank_client = None
+        self._embed_client = embed_client
+        self._vision_client = vision_client
+        self._chat_client = chat_client
+        self._rerank_client = rerank_client
+        self._injected = {
+            id(client)
+            for client in (embed_client, vision_client, chat_client, rerank_client)
+            if client is not None
+        }
+        self._entries_cache = None
+        self._entries_stamp = None
+        self._index_cache = None
+        self._index_stamp = None
 
     async def __aenter__(self) -> "MemeVault":
         return self
@@ -88,6 +118,7 @@ class MemeVault:
                 model=self.embedding_model,
                 api_key=self.api_key,
                 base_url=self.embedding_base_url,
+                timeout=defaults.EMBEDDING_TIMEOUT,
             )
         return self._embed_client
 
@@ -99,6 +130,15 @@ class MemeVault:
                 base_url=self.vision_base_url,
             )
         return self._vision_client
+
+    def _get_chat_client(self):
+        if self._chat_client is None:
+            self._chat_client = AIClient(
+                model=self.chat_model,
+                api_key=self.chat_api_key,
+                base_url=self.chat_base_url,
+            )
+        return self._chat_client
 
     def _get_rerank_client(self):
         if self._rerank_client is None:
@@ -117,6 +157,31 @@ class MemeVault:
             models[model] = models.get(model, 0) + 1
         return models
 
+    def _entries(self) -> list[Metadata]:
+        """Entries for the current search or write; re-read only when the vault changed on disk."""
+        stamp = directory_stamp(self.data_dir)
+        if self._entries_cache is None or stamp != self._entries_stamp:
+            self._entries_cache = load_metadata(self.data_dir)
+            self._entries_stamp = directory_stamp(self.data_dir)  # loading may migrate
+        return self._entries_cache
+
+    def _save(self, entries: list[Metadata], changed: list[Metadata] | None = None):
+        save_metadata(entries, self.data_dir, changed=changed)
+        self._entries_cache = entries
+        self._entries_stamp = directory_stamp(self.data_dir)
+
+    def _load_index(self):
+        """The saved search index; re-read only when the index file changed."""
+        try:
+            stat = os.stat(self.index_path)
+            stamp = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            stamp = None
+        if self._index_cache is None or stamp != self._index_stamp:
+            self._index_cache = load_search_index(self.index_path)
+            self._index_stamp = stamp
+        return self._index_cache
+
     async def parse(self, image_path: str) -> Metadata:
         """Analyze one image and store or replace its metadata entry."""
         entry = Metadata(image_path)
@@ -126,25 +191,25 @@ class MemeVault:
         if error:
             raise RuntimeError(f"Vision API error: {error.get('error', '?')}")
 
-        entries = load_metadata(self.metadata_path)
+        entries = self._entries()
         for index, existing in enumerate(entries):
             if existing.id == entry.id:
                 entries[index] = entry
-                save_metadata(entries, self.metadata_path)
+                self._save(entries, changed=[entry])
                 return entry
         entries.append(entry)
-        save_metadata(entries, self.metadata_path)
+        self._save(entries, changed=[entry])
         return entry
 
     async def parse_dir(self, root_dir: str, force: bool = False) -> int:
         if not os.path.isdir(root_dir):
             raise ValueError(f"Directory not found: {root_dir}")
-        entries = load_metadata(self.metadata_path)
+        entries = self._entries()
         id_index = {entry.id: index for index, entry in enumerate(entries) if entry.id}
         old_models = {entry.id: entry.analyzed_by for entry in entries if entry.id}
-        added = 0
         client = self._get_vision_client()
 
+        pending = []
         for image_path in _iter_images(root_dir):
             entry = Metadata(image_path)
             if not entry.id:
@@ -155,9 +220,19 @@ class MemeVault:
                 and old_models.get(entry.id) == self.vision_model
             ):
                 continue
-            error = await entry.analyze(client)
+            pending.append(entry)
+
+        semaphore = asyncio.Semaphore(max(1, defaults.PARSE_CONCURRENCY))
+
+        async def analyze(entry: Metadata):
+            async with semaphore:
+                return entry, await entry.analyze(client)
+
+        added = 0
+        changed = []
+        for entry, error in await asyncio.gather(*(analyze(item) for item in pending)):
             if error:
-                print(f"  SKIP: {image_path} - {error.get('error', '?')}")
+                print(f"  SKIP: {entry.path} - {error.get('error', '?')}")
                 continue
             if entry.id in id_index:
                 entries[id_index[entry.id]] = entry
@@ -167,12 +242,13 @@ class MemeVault:
                 id_index[entry.id] = len(entries) - 1
                 added += 1
                 print(f"  [{added}] {entry.text}")
-        save_metadata(entries, self.metadata_path)
+            changed.append(entry)
+        self._save(entries, changed=changed)
         return added
 
     def _load_current_index(self, entries: list[Metadata]):
         try:
-            index = load_search_index(self.index_path)
+            index = self._load_index()
         except RuntimeError:
             return None
         manifest = index.manifest
@@ -187,19 +263,25 @@ class MemeVault:
         return index
 
     async def build(self, force: bool = False) -> int:
-        entries = load_metadata(self.metadata_path)
+        entries = self._entries()
         if not entries:
             raise ValueError("No entries. Add some with parse() first.")
         if not force and self._load_current_index(entries) is not None:
             return len(entries)
 
-        index = await build_search_index(self._get_embed_client(), entries)
+        try:
+            previous = self._load_index()
+        except RuntimeError:
+            previous = None
+        index = await build_search_index(self._get_embed_client(), entries, previous=previous)
         save_search_index(
             index,
             self.index_path,
             model=self.embedding_model,
             fingerprint=metadata_fingerprint(entries),
         )
+        self._index_cache = None
+        self._index_stamp = None
         return index.count
 
     async def _ensure_index(self, entries: list[Metadata]):
@@ -207,7 +289,7 @@ class MemeVault:
         if index is not None:
             return index
         await self.build(force=True)
-        return load_search_index(self.index_path)
+        return self._load_index()
 
     async def search(
         self,
@@ -223,12 +305,12 @@ class MemeVault:
         if weights is not None and not isinstance(weights, dict):
             raise TypeError("weights must be a dict mapping dimensions to numbers.")
 
-        entries = load_metadata(self.metadata_path)
+        entries = self._entries()
         if not entries:
             return []
         index = await self._ensure_index(entries)
         if isinstance(query, str):
-            parsed = await parse_search_query(self._get_vision_client(), query)
+            parsed = await parse_search_query(self._get_chat_client(), query)
         else:
             parsed = query
         candidates = max(top_n, defaults.RERANK_CANDIDATES) if rerank else top_n
@@ -273,7 +355,7 @@ class MemeVault:
 
     def prune(self) -> list[Metadata]:
         """Remove entries whose image files no longer exist on disk."""
-        entries = load_metadata(self.metadata_path)
+        entries = self._entries()
         kept, removed = [], []
         for entry in entries:
             if entry.path and os.path.exists(entry.path):
@@ -281,7 +363,7 @@ class MemeVault:
             else:
                 removed.append(entry)
         if removed:
-            save_metadata(kept, self.metadata_path)
+            self._save(kept, changed=[])
         return removed
 
     def _find_image_root(self) -> str | None:
@@ -293,13 +375,13 @@ class MemeVault:
         return next((path for path in candidates if os.path.isdir(path)), None)
 
     def status(self) -> dict:
-        entries = load_metadata(self.metadata_path)
+        entries = self._entries()
         analyzed = sum(1 for entry in entries if entry.analyzed_at)
         paths_exist = sum(1 for entry in entries if entry.path and os.path.exists(entry.path))
 
         index_info = None
         try:
-            index = load_search_index(self.index_path)
+            index = self._load_index()
             manifest = index.manifest
             index_info = {
                 "version": manifest.get("version"),
@@ -329,6 +411,7 @@ class MemeVault:
             "api_key": bool(self.api_key),
             "embedding_model": self.embedding_model,
             "vision_model": self.vision_model,
+            "chat_model": self.chat_model,
             "rerank_model": self.rerank_model,
             "metadata": {
                 "total": len(entries),
@@ -346,13 +429,10 @@ class MemeVault:
         }
 
     async def close(self):
-        clients = {
-            id(client): client
-            for client in (self._embed_client, self._vision_client, self._rerank_client)
-            if client
-        }
-        for client in clients.values():
+        """Close the clients this vault created; injected clients stay with their owner."""
+        for name in ("_embed_client", "_vision_client", "_chat_client", "_rerank_client"):
+            client = getattr(self, name)
+            if client is None or id(client) in self._injected:
+                continue
             await client.close()
-        self._embed_client = None
-        self._vision_client = None
-        self._rerank_client = None
+            setattr(self, name, None)

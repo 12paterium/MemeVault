@@ -10,7 +10,7 @@ import numpy as np
 
 from . import config
 from .client import AIClient
-from .metadata import Metadata
+from .metadata import Metadata, image_stem
 
 
 DIMENSIONS = ("character", "usage", "content")
@@ -19,7 +19,7 @@ DEFAULT_WEIGHTS = {
     "usage": config.USAGE_WEIGHT,
     "content": config.CONTENT_WEIGHT,
 }
-INDEX_VERSION = 1
+INDEX_VERSION = 2
 
 QUERY_SCHEMA = {
     "type": "object",
@@ -75,12 +75,24 @@ class SearchIndex:
     vectors: dict[str, np.ndarray]
     masks: dict[str, np.ndarray]
     manifest: dict = field(default_factory=dict)
+    ids: list[str] = field(default_factory=list)
+    hashes: dict[str, np.ndarray] = field(default_factory=dict)
 
     @property
     def count(self) -> int:
         if not self.vectors:
             return 0
         return next(iter(self.vectors.values())).shape[0]
+
+    @property
+    def dimension_size(self) -> int:
+        if not self.vectors:
+            return 0
+        return next(iter(self.vectors.values())).shape[1]
+
+
+def _text_hash(text: str) -> int:
+    return int.from_bytes(hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest(), "little")
 
 
 def _clean_query_value(value) -> str:
@@ -101,7 +113,7 @@ def _join_values(values) -> str:
 
 def _content_text(entry: Metadata) -> str:
     parts = []
-    filename = os.path.splitext(os.path.basename(entry.path))[0].strip()
+    filename = image_stem(entry)
     if filename and filename != entry.text:
         parts.append(f"filename: {filename}")
     if entry.text:
@@ -128,7 +140,7 @@ def prepare_dimension_texts(entries: list[Metadata]) -> dict[str, list[str]]:
 def rerank_text(entry: Metadata) -> str:
     """Full text of one entry for cross-encoder reranking: content plus character and usage."""
     parts = []
-    filename = os.path.splitext(os.path.basename(entry.path))[0].strip()
+    filename = image_stem(entry)
     if filename:
         parts.append(f"filename: {filename}")
     if entry.text:
@@ -186,48 +198,80 @@ def _normalize_rows(vectors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return normalized, mask
 
 
-async def build_search_index(client: AIClient, entries: list[Metadata]) -> SearchIndex:
+async def build_search_index(
+    client: AIClient,
+    entries: list[Metadata],
+    previous: SearchIndex | None = None,
+) -> SearchIndex:
+    """Build the three-channel index, re-embedding only rows that changed since `previous`."""
     if not entries:
         raise ValueError("Cannot build an index without metadata entries.")
 
     dimension_texts = prepare_dimension_texts(entries)
-    positions = []
-    inputs = []
-    masks = {}
+    masks = {
+        dimension: np.array([bool(text.strip()) for text in dimension_texts[dimension]], dtype=np.bool_)
+        for dimension in DIMENSIONS
+    }
+    hashes = {
+        dimension: np.array([_text_hash(text) for text in dimension_texts[dimension]], dtype=np.uint64)
+        for dimension in DIMENSIONS
+    }
+    ids = [entry.id for entry in entries]
+
+    lookup = {}
+    if previous is not None and previous.manifest.get("model") == client.model and previous.ids:
+        for dimension in DIMENSIONS:
+            lookup[dimension] = {
+                entry_id: (row, int(previous.hashes[dimension][row]))
+                for row, entry_id in enumerate(previous.ids)
+            }
+
+    reused = {}
+    pending = []
     for dimension in DIMENSIONS:
         texts = dimension_texts[dimension]
-        mask = np.array([bool(text.strip()) for text in texts], dtype=np.bool_)
-        masks[dimension] = mask
-        for row in np.flatnonzero(mask):
-            positions.append((dimension, int(row)))
-            inputs.append(texts[row])
+        for row in np.flatnonzero(masks[dimension]):
+            row = int(row)
+            match = lookup.get(dimension, {}).get(ids[row])
+            if match is not None and match[1] == int(hashes[dimension][row]):
+                reused[(dimension, row)] = previous.vectors[dimension][match[0]]
+            else:
+                pending.append((dimension, row, texts[row]))
 
-    if not inputs:
+    if not pending and not reused:
         raise ValueError("Metadata entries do not contain any searchable fields.")
 
-    embedded = np.asarray(await _embed_batches(client, inputs), dtype=np.float32)
-    if embedded.ndim != 2 or embedded.shape[0] != len(inputs):
-        raise RuntimeError(f"Invalid embedding response shape: {embedded.shape}.")
-    dimension_size = embedded.shape[1]
+    embedded = None
+    if pending:
+        embedded = np.asarray(await _embed_batches(client, [text for _, _, text in pending]), dtype=np.float32)
+        if embedded.ndim != 2 or embedded.shape[0] != len(pending):
+            raise RuntimeError(f"Invalid embedding response shape: {embedded.shape}.")
+
+    dimension_size = embedded.shape[1] if embedded is not None else previous.dimension_size
     vectors = {
         dimension: np.zeros((len(entries), dimension_size), dtype=np.float32)
         for dimension in DIMENSIONS
     }
-    for (dimension, row), vector in zip(positions, embedded):
-        vectors[dimension][row] = vector
+    for (dimension, row), vector in reused.items():
+        if vector.shape[0] == dimension_size:
+            vectors[dimension][row] = vector
+    if embedded is not None:
+        for (dimension, row, _), vector in zip(pending, embedded):
+            vectors[dimension][row] = vector
 
     for dimension in DIMENSIONS:
         vectors[dimension], valid_vectors = _normalize_rows(vectors[dimension])
         masks[dimension] &= valid_vectors
-    return SearchIndex(vectors=vectors, masks=masks)
+    return SearchIndex(vectors=vectors, masks=masks, ids=ids, hashes=hashes)
 
 
 def metadata_fingerprint(entries: list[Metadata]) -> str:
+    """Fingerprint of everything the index depends on; location-independent (basename only)."""
     indexed_data = []
     for entry in entries:
         indexed_data.append({
             "id": entry.id,
-            "path": entry.path,
+            "path": os.path.basename(entry.path),
             "text": entry.text,
             "tags": entry.tags,
             "character": entry.character,
@@ -263,6 +307,8 @@ def save_search_index(
     for dimension in DIMENSIONS:
         arrays[dimension] = index.vectors[dimension]
         arrays[f"{dimension}_mask"] = index.masks[dimension]
+        arrays[f"{dimension}_hash"] = index.hashes[dimension]
+    arrays["ids"] = np.array(index.ids, dtype=np.str_)
     np.savez_compressed(temp_index, **arrays)
 
     manifest = {
@@ -270,7 +316,7 @@ def save_search_index(
         "model": model,
         "count": index.count,
         "dimensions": list(DIMENSIONS),
-        "dimension_size": next(iter(index.vectors.values())).shape[1],
+        "dimension_size": index.dimension_size,
         "fingerprint": fingerprint,
     }
     with open(temp_manifest, "w", encoding="utf-8") as file:
@@ -293,6 +339,11 @@ def load_search_index(index_path: str) -> SearchIndex:
                 dimension: np.asarray(data[f"{dimension}_mask"], dtype=np.bool_)
                 for dimension in DIMENSIONS
             }
+            hashes = {
+                dimension: np.asarray(data[f"{dimension}_hash"], dtype=np.uint64)
+                for dimension in DIMENSIONS
+            }
+            ids = [str(value) for value in data["ids"]]
     except (
         EOFError,
         FileNotFoundError,
@@ -315,6 +366,10 @@ def load_search_index(index_path: str) -> SearchIndex:
     count = next(iter(counts))
     if any(mask.shape != (count,) for mask in masks.values()):
         raise RuntimeError("Search index masks are inconsistent with its vectors.")
+    if any(hashes[dimension].shape != (count,) for dimension in DIMENSIONS):
+        raise RuntimeError("Search index hashes are inconsistent with its vectors.")
+    if len(ids) != count:
+        raise RuntimeError("Search index ids are inconsistent with its vectors.")
     if manifest.get("count") != count:
         raise RuntimeError("Search index manifest count does not match its vectors.")
     if manifest.get("version") != INDEX_VERSION:
@@ -323,7 +378,7 @@ def load_search_index(index_path: str) -> SearchIndex:
         raise RuntimeError("Search index manifest dimensions are invalid.")
     if manifest.get("dimension_size") != next(iter(widths)):
         raise RuntimeError("Search index manifest dimension size is invalid.")
-    return SearchIndex(vectors=vectors, masks=masks, manifest=manifest)
+    return SearchIndex(vectors=vectors, masks=masks, manifest=manifest, ids=ids, hashes=hashes)
 
 
 async def parse_search_query(client: AIClient, query: str) -> SearchQuery:

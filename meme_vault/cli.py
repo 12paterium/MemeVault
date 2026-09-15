@@ -139,6 +139,7 @@ async def main(argv=None):
             print(f"API key:         {'OK' if status['api_key'] else 'Missing'}")
             print(f"Embedding model: {status['embedding_model']}")
             print(f"Vision model:    {status['vision_model']}")
+            print(f"Chat model:      {status['chat_model']}")
             print(f"Rerank model:    {status['rerank_model']}")
             print()
             print(f"Metadata: {metadata['total']} entries ({metadata['analyzed']} analyzed)")

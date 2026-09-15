@@ -12,6 +12,8 @@ from meme_vault.embedding import (
     load_search_index,
     metadata_fingerprint,
     parse_search_query,
+    prepare_dimension_texts,
+    rerank_text,
     save_search_index,
     search,
 )
@@ -303,3 +305,22 @@ class QueryParsingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "Query cannot be empty"):
             await parse_search_query(client, "  ")
         self.assertEqual(client.chat_calls, [])
+
+
+class FilenameTests(unittest.TestCase):
+    def test_vault_id_suffix_is_stripped_from_indexed_filename(self):
+        entry = Metadata.from_dict({
+            "id": "c3d4e5f6" + "0" * 24,
+            "path": "images/doro 疑惑.c3d4e5f6.jpg",
+            "text": "一个困惑的表情",
+        })
+
+        content = prepare_dimension_texts([entry])["content"][0]
+
+        self.assertIn("filename: doro 疑惑", content)
+        self.assertNotIn("c3d4e5f6", content)
+        self.assertIn("filename: doro 疑惑", rerank_text(entry))
+
+    def test_plain_filename_is_kept(self):
+        entry = Metadata.from_dict({"id": "abc", "path": "images/猫 图.jpg", "text": "一只猫"})
+        self.assertIn("filename: 猫 图", prepare_dimension_texts([entry])["content"][0])

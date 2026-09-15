@@ -1,11 +1,13 @@
-import json
 import io
+import json
 import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 
-from meme_vault.embedding import SearchQuery
+import numpy as np
+
+from meme_vault.embedding import SearchQuery, load_search_index
 from meme_vault.metadata import Metadata, load_metadata, save_metadata
 from meme_vault.vault import IMAGE_EXTS, MemeVault
 
@@ -18,9 +20,9 @@ class FakeVisionClient:
     def __init__(self):
         self.parse_calls = []
 
-    async def parse_image(self, path):
-        self.parse_calls.append(path)
-        filename = os.path.splitext(os.path.basename(path))[0]
+    async def parse_image(self, path, filename=None):
+        self.parse_calls.append((path, filename))
+        filename = filename or os.path.splitext(os.path.basename(path))[0]
         character = ["初音未来"] if "初音未来" in filename else ["未知角色"]
         return {
             "text": filename,
@@ -76,8 +78,7 @@ class MemeVaultTests(unittest.IsolatedAsyncioTestCase):
             }),
         ]
         with tempfile.TemporaryDirectory() as directory:
-            metadata_path = os.path.join(directory, "metadata.json")
-            save_metadata(entries, metadata_path)
+            save_metadata(entries, directory)
             vault = MemeVault(
                 data_dir=directory,
                 api_key="test",
@@ -90,8 +91,14 @@ class MemeVaultTests(unittest.IsolatedAsyncioTestCase):
                 "character": "初音未来",
                 "usage": "吐槽",
             }, ensure_ascii=False))
+            chat_client = FakeClient(chat_response=json.dumps({
+                "content": "开心",
+                "character": "初音未来",
+                "usage": "吐槽",
+            }, ensure_ascii=False))
             vault._embed_client = embed_client
             vault._vision_client = vision_client
+            vault._chat_client = chat_client
 
             count = await vault.build()
             self.assertEqual(count, 2)
@@ -110,10 +117,11 @@ class MemeVaultTests(unittest.IsolatedAsyncioTestCase):
 
             parsed_results = await vault.search("找初音未来吐槽群友的图", top_n=1)
             self.assertEqual(parsed_results[0].metadata.id, "miku")
-            self.assertEqual(len(vision_client.chat_calls), 1)
+            self.assertEqual(len(chat_client.chat_calls), 1)
+            self.assertEqual(vision_client.chat_calls, [])
 
             entries[0].usage = ["庆祝"]
-            save_metadata(entries, metadata_path)
+            save_metadata(entries, directory)
             await vault.search(SearchQuery(content="开心"), top_n=1)
             self.assertGreater(len(embed_client.embed_calls), first_build_calls)
             await vault.close()
@@ -138,12 +146,12 @@ class MemeVaultTests(unittest.IsolatedAsyncioTestCase):
                 "path": "doraemon.jpg",
                 "text": "开心",
                 "character": ["哆啦A梦"],
-                "usage": ["吐槽"],
+                "usage": ["庆祝"],
                 "emotion": ["开心"],
             }),
         ]
         with tempfile.TemporaryDirectory() as directory:
-            save_metadata(entries, os.path.join(directory, "metadata.json"))
+            save_metadata(entries, directory)
             async with MemeVault(
                 data_dir=directory,
                 api_key="test",
@@ -204,7 +212,7 @@ class RerankTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rerank_reorders_candidates(self):
         with tempfile.TemporaryDirectory() as directory:
-            save_metadata(self._entries(), os.path.join(directory, "metadata.json"))
+            save_metadata(self._entries(), directory)
             vault = await self._vault(directory)
 
             baseline = await vault.search(SearchQuery(character="初音未来"), top_n=2)
@@ -226,7 +234,7 @@ class RerankTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rerank_failure_keeps_rrf_order(self):
         with tempfile.TemporaryDirectory() as directory:
-            save_metadata(self._entries(), os.path.join(directory, "metadata.json"))
+            save_metadata(self._entries(), directory)
             vault = await self._vault(directory)
             vault._rerank_client = FakeRerankClient(error=RuntimeError("rerank down"))
 
@@ -247,12 +255,11 @@ class PruneTests(unittest.TestCase):
                 Metadata.from_dict({"id": "keep", "path": existing, "text": "保留"}),
                 Metadata.from_dict({"id": "drop", "path": os.path.join(directory, "gone.jpg"), "text": "清理"}),
             ]
-            metadata_path = os.path.join(directory, "metadata.json")
-            save_metadata(entries, metadata_path)
+            save_metadata(entries, directory)
             vault = MemeVault(data_dir=directory, api_key="test")
             removed = vault.prune()
             self.assertEqual([entry.id for entry in removed], ["drop"])
-            self.assertEqual([entry.id for entry in load_metadata(metadata_path)], ["keep"])
+            self.assertEqual([entry.id for entry in load_metadata(directory)], ["keep"])
             self.assertEqual(vault.prune(), [])
 
 
@@ -305,7 +312,9 @@ class ResourceImagesTests(unittest.IsolatedAsyncioTestCase):
                 added = await vault.parse_dir(resource_root)
             self.assertEqual(added, image_count)
             self.assertEqual(len(vision_client.parse_calls), image_count)
-            self.assertEqual(len(load_metadata(vault.metadata_path)), image_count)
+            for path, filename in vision_client.parse_calls:
+                self.assertEqual(filename, os.path.splitext(os.path.basename(path))[0].strip())
+            self.assertEqual(len(load_metadata(vault.data_dir)), image_count)
 
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(await vault.parse_dir(resource_root), 0)
@@ -322,3 +331,184 @@ class ResourceImagesTests(unittest.IsolatedAsyncioTestCase):
                 "ResourceImages entries containing 初音未来 should rank in the top results",
             )
             await vault.close()
+
+
+class ProviderConfigTests(unittest.TestCase):
+    def test_chat_follows_vision_unless_configured(self):
+        vault = MemeVault(
+            data_dir=".",
+            api_key="main-key",
+            vision_model="vision-model",
+            vision_api_key="vision-key",
+            vision_base_url="http://vision",
+        )
+        self.assertEqual(vault.chat_model, "vision-model")
+        self.assertEqual(vault.chat_api_key, "vision-key")
+        self.assertEqual(vault.chat_base_url, "http://vision")
+
+        split = MemeVault(
+            data_dir=".",
+            api_key="main-key",
+            vision_api_key="vision-key",
+            vision_base_url="http://vision",
+            chat_model="chat-model",
+            chat_api_key="chat-key",
+            chat_base_url="http://chat",
+        )
+        self.assertEqual(split.chat_model, "chat-model")
+        self.assertEqual(split.chat_api_key, "chat-key")
+        self.assertEqual(split.chat_base_url, "http://chat")
+        self.assertEqual(split.vision_model, "Qwen/Qwen3-VL-32B-Instruct")
+
+
+class RecordingClient:
+    """Minimal stand-in for AIClient, recording what the vault asks of it."""
+
+    def __init__(self, model):
+        self.model = model
+        self.parsed = []
+        self.closed = False
+
+    async def chat(self, messages, temperature=0.2, response_format=None):
+        return '{"content": "无语"}'
+
+    async def parse_image(self, path, filename=None):
+        self.parsed.append((path, filename))
+        return {"text": "图", "tags": [], "character": [], "emotion": [], "usage": [], "background": "无"}
+
+    async def embed(self, inputs):
+        return [[1.0, 0.0] for _ in inputs]
+
+    async def rerank(self, query, documents, top_n=None):
+        return [(index, 1.0) for index in range(len(documents))]
+
+    async def close(self):
+        self.closed = True
+
+
+class InjectedClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_injected_clients_are_used_and_kept_alive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, "猫 疑惑.jpg")
+            with open(source, "wb") as file:
+                file.write(b"fake-image-bytes")
+            vision = RecordingClient("injected-vision")
+            chat = RecordingClient("injected-chat")
+            vault = MemeVault(
+                data_dir=os.path.join(directory, "vault"),
+                chat_client=chat,
+                vision_client=vision,
+            )
+            self.assertEqual(vault.vision_model, "injected-vision")
+            self.assertEqual(vault.chat_model, "injected-chat")
+
+            entry = await vault.parse(source)
+            await vault.close()
+
+            self.assertEqual(vision.parsed, [(source, "猫 疑惑")])
+            self.assertEqual(entry.analyzed_by, "injected-vision")
+            self.assertFalse(vision.closed, "injected clients belong to the caller")
+            self.assertFalse(chat.closed)
+            self.assertIs(vault._vision_client, vision)
+
+    async def test_explicit_names_override_injected_clients(self):
+        vault = MemeVault(
+            data_dir=".",
+            chat_model="explicit-chat",
+            chat_client=RecordingClient("injected-chat"),
+        )
+        self.assertEqual(vault.chat_model, "explicit-chat")
+
+    async def test_created_clients_are_closed(self):
+        vault = MemeVault(data_dir=".", api_key="key", embedding_model="m")
+        created = vault._get_embed_client()
+        await vault.close()
+
+        self.assertIsNone(vault._embed_client)
+        self.assertIsNot(vault._get_embed_client(), created)
+
+
+class CacheTests(unittest.TestCase):
+    def _entry(self, identifier, path):
+        return Metadata.from_dict({"id": identifier, "path": path, "text": "图"})
+
+    def test_entries_cache_reuses_and_refreshes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            save_metadata([self._entry("a", "a.jpg")], directory)
+            vault = MemeVault(data_dir=directory, api_key="test")
+
+            self.assertEqual([entry.id for entry in vault._entries()], ["a"])
+            self.assertIs(vault._entries(), vault._entries(), "an unchanged vault must reuse its cache")
+
+            save_metadata([self._entry("a", "a.jpg"), self._entry("b", "b.jpg")], directory)
+            self.assertEqual([entry.id for entry in vault._entries()], ["a", "b"])
+
+
+class IndexReuseTests(unittest.IsolatedAsyncioTestCase):
+    def _entries(self):
+        return [
+            Metadata.from_dict({
+                "id": "miku",
+                "path": "miku.jpg",
+                "text": "悲伤的反应",
+                "character": ["初音未来"],
+                "usage": ["吐槽"],
+                "emotion": ["悲伤"],
+            }),
+            Metadata.from_dict({
+                "id": "doraemon",
+                "path": "doraemon.jpg",
+                "text": "开心的反应",
+                "character": ["哆啦A梦"],
+                "usage": ["庆祝"],
+                "emotion": ["开心"],
+            }),
+        ]
+
+    def _vault(self, directory, model):
+        vault = MemeVault(
+            data_dir=directory,
+            api_key="test",
+            embedding_model=model,
+            vision_model="fake-vision",
+        )
+        vault._embed_client = FakeClient()
+        vault._embed_client.model = model
+        return vault
+
+    async def test_rebuild_embeds_only_changed_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entries = self._entries()
+            save_metadata(entries, directory)
+            vault = self._vault(directory, "fake-model")
+
+            await vault.build()
+            full_texts = sum(len(batch) for batch in vault._embed_client.embed_calls)
+            before = load_search_index(vault.index_path)
+
+            entries[0].text = "全新的描述"
+            save_metadata(entries, directory, changed=[entries[0]])
+            await vault.build(force=True)
+
+            incremental_texts = sum(len(batch) for batch in vault._embed_client.embed_calls) - full_texts
+            self.assertEqual(incremental_texts, 1, "only the changed content row should be re-embedded")
+
+            after = load_search_index(vault.index_path)
+            for dimension in ("character", "usage", "content"):
+                np.testing.assert_array_equal(before.vectors[dimension][1], after.vectors[dimension][1])
+            await vault.close()
+
+    async def test_model_change_reembeds_everything(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entries = self._entries()
+            save_metadata(entries, directory)
+            first = self._vault(directory, "fake-model")
+            await first.build()
+            full_texts = sum(len(batch) for batch in first._embed_client.embed_calls)
+
+            second = self._vault(directory, "other-model")
+            await second.build(force=True)
+
+            self.assertEqual(sum(len(batch) for batch in second._embed_client.embed_calls), full_texts)
+            await first.close()
+            await second.close()
